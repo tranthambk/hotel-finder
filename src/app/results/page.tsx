@@ -21,6 +21,46 @@ const MapView = dynamic(() => import('@/components/MapView'), {
   ),
 })
 
+const CACHE_PREFIX = 'hotel_cache:'
+
+function getCacheKey(params: SearchParams, sites: string[]) {
+  const p = {
+    destination: params.destination,
+    checkIn: params.checkIn,
+    checkOut: params.checkOut,
+    adults: params.adults,
+    children: params.children,
+    rooms: params.rooms,
+    limit: params.limit,
+    priorities: [...params.priorities].sort().join(','),
+    sites: [...sites].sort().join(','),
+  }
+  return CACHE_PREFIX + JSON.stringify(p)
+}
+
+type CacheEntry = {
+  hotels: Hotel[]
+  sources: string[]
+  runLinks: { site: string; url: string }[]
+}
+
+function readCache(key: string): CacheEntry | null {
+  try {
+    const raw = sessionStorage.getItem(key)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+function writeCache(key: string, entry: CacheEntry) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify(entry))
+  } catch {
+    // sessionStorage full or unavailable — ignore
+  }
+}
+
 function ResultsContent() {
   const searchParams = useSearchParams()
   const router = useRouter()
@@ -48,19 +88,37 @@ function ResultsContent() {
   const [loadingMessage, setLoadingMessage] = useState('')
   const [pendingSites, setPendingSites] = useState(0)
   const [runLinks, setRunLinks] = useState<{ site: string; url: string }[]>([])
+  const [fromCache, setFromCache] = useState(false)
   const { t } = useApp()
 
   const refreshFavs = useCallback(() => {
     setFavIds(new Set(getFavorites().map((h) => h.id)))
   }, [])
 
-  const fetchHotels = useCallback(async () => {
+  const fetchHotels = useCallback(async (forceRefresh = false) => {
     if (!params.destination) return
+
+    // Check cache first
+    if (!forceRefresh) {
+      const cacheKey = getCacheKey(params, sites)
+      const cached = readCache(cacheKey)
+      if (cached) {
+        setHotels(cached.hotels)
+        setSources(cached.sources)
+        setRunLinks(cached.runLinks)
+        setFromCache(true)
+        setLoading(false)
+        setFavIds(new Set(getFavorites().map((h) => h.id)))
+        return
+      }
+    }
+
     setLoading(true)
     setError(null)
     setHotels([])
     setSources([])
     setRunLinks([])
+    setFromCache(false)
     setPendingSites(sites.length)
 
     const messages = [
@@ -88,6 +146,10 @@ function ResultsContent() {
       const reader = res.body!.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      // Accumulate for cache write at end
+      let allHotels: Hotel[] = []
+      let allSources: string[] = []
+      let allRunLinks: { site: string; url: string }[] = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -101,19 +163,17 @@ function ResultsContent() {
           try {
             const chunk = JSON.parse(line)
             if (chunk.type === 'site_result') {
-              setHotels((prev) => {
-                const merged = [...prev, ...(chunk.hotels || [])]
-                if (params.priorities.includes('price')) {
-                  merged.sort((a, b) => (a.price?.amount ?? Infinity) - (b.price?.amount ?? Infinity))
-                } else if (params.priorities.includes('rating')) {
-                  merged.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
-                }
-                return merged
-              })
-              setSources((prev) => [...prev, chunk.site])
-              if (chunk.runUrl) {
-                setRunLinks((prev) => [...prev, { site: chunk.site, url: chunk.runUrl }])
+              allHotels = [...allHotels, ...(chunk.hotels || [])]
+              if (params.priorities.includes('price')) {
+                allHotels.sort((a, b) => (a.price?.amount ?? Infinity) - (b.price?.amount ?? Infinity))
+              } else if (params.priorities.includes('rating')) {
+                allHotels.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
               }
+              allSources = [...allSources, chunk.site]
+              if (chunk.runUrl) allRunLinks = [...allRunLinks, { site: chunk.site, url: chunk.runUrl }]
+              setHotels([...allHotels])
+              setSources([...allSources])
+              setRunLinks([...allRunLinks])
               setPendingSites((prev) => Math.max(0, prev - 1))
               setLoading(false)
             } else if (chunk.type === 'site_error') {
@@ -127,6 +187,9 @@ function ResultsContent() {
           }
         }
       }
+
+      // Save to cache
+      writeCache(getCacheKey(params, sites), { hotels: allHotels, sources: allSources, runLinks: allRunLinks })
       setFavIds(new Set(getFavorites().map((h) => h.id)))
     } catch (err) {
       setError(String(err))
@@ -185,10 +248,11 @@ function ResultsContent() {
                 <ExportButton hotels={displayedHotels} params={params} />
               </>
             )}
-            <button onClick={fetchHotels} disabled={loading}
-              className="flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-400 hover:text-white rounded-xl text-sm transition disabled:opacity-50">
+            <button onClick={() => fetchHotels(true)} disabled={loading}
+              className="flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-400 hover:text-white rounded-xl text-sm transition disabled:opacity-50"
+              title={fromCache ? 'Kết quả từ cache — nhấn để tìm lại' : 'Tìm lại'}>
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-              {t('res.refresh')}
+              {fromCache ? '⚡ Cache' : t('res.refresh')}
             </button>
           </div>
         </div>
@@ -260,7 +324,7 @@ function ResultsContent() {
               <p className="text-gray-400 text-sm max-w-md">{error}</p>
             </div>
             <button
-              onClick={fetchHotels}
+              onClick={() => fetchHotels(true)}
               className="flex items-center gap-2 px-6 py-3 bg-amber-500 hover:bg-amber-400 text-white rounded-xl font-medium transition"
             >
               <RefreshCw className="w-4 h-4" />
