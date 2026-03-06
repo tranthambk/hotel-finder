@@ -15,7 +15,7 @@ export async function searchHotelsOnSite(
   searchUrl: string,
   params: SearchParams,
   limit: number
-): Promise<Hotel[]> {
+): Promise<{ hotels: Hotel[], runId?: string }> {
   const apiKey = process.env.TINYFISH_API_KEY
   if (!apiKey) throw new Error('TINYFISH_API_KEY not configured')
 
@@ -29,13 +29,19 @@ export async function searchHotelsOnSite(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ url: searchUrl, goal }),
-    signal: AbortSignal.timeout(360_000), // 6 minutes
+    signal: AbortSignal.timeout(360_000),
   })
 
   if (!response.ok) {
     const text = await response.text()
     throw new Error(`Tinyfish ${response.status}: ${text}`)
   }
+
+  // Try to get run ID from response headers
+  let runId: string | undefined =
+    response.headers.get('x-run-id') ||
+    response.headers.get('x-request-id') ||
+    undefined
 
   const reader = response.body?.getReader()
   if (!reader) throw new Error('No response body')
@@ -48,9 +54,7 @@ export async function searchHotelsOnSite(
     if (done) break
     buffer += decoder.decode(value, { stream: true })
 
-    // Check each line for COMPLETE event as we receive it
     const lines = buffer.split('\n')
-    // Keep last incomplete line in buffer
     buffer = lines.pop() ?? ''
 
     for (const line of lines) {
@@ -60,9 +64,15 @@ export async function searchHotelsOnSite(
 
       try {
         const parsed = JSON.parse(data)
+
+        // Capture run ID from any event field
+        if (!runId) {
+          runId = parsed.runId || parsed.run_id || parsed.id || parsed.executionId || undefined
+        }
+
         if (parsed.type === 'COMPLETE' && parsed.resultJson !== undefined) {
-          console.log(`[tinyfish] ${siteName} COMPLETE. resultJson:`, JSON.stringify(parsed.resultJson).slice(0, 300))
-          return parseHotels(parsed.resultJson, siteName, searchUrl)
+          console.log(`[tinyfish] ${siteName} COMPLETE runId=${runId}. resultJson:`, JSON.stringify(parsed.resultJson).slice(0, 300))
+          return { hotels: parseHotels(parsed.resultJson, siteName, searchUrl), runId }
         }
       } catch {
         // not JSON, continue
@@ -71,7 +81,7 @@ export async function searchHotelsOnSite(
   }
 
   console.warn(`[tinyfish] ${siteName}: stream ended without COMPLETE event`)
-  return []
+  return { hotels: [], runId }
 }
 
 function parseHotels(resultJson: unknown, siteName: string, siteUrl: string): Hotel[] {
@@ -118,7 +128,6 @@ function parseHotels(resultJson: unknown, siteName: string, siteUrl: string): Ho
     const priceDisplay = String(item.price_display || item.price_text || item.price || '')
     const priceNum = priceRaw ? Number(String(priceRaw).replace(/[^\d.]/g, '')) : 0
 
-    // Detect currency from display string or explicit field
     const detectedCurrency = (() => {
       if (item.currency) return String(item.currency).toUpperCase()
       if (/\$/.test(priceDisplay)) return 'USD'
@@ -128,7 +137,6 @@ function parseHotels(resultJson: unknown, siteName: string, siteUrl: string): Ho
       return 'VND'
     })()
 
-    // Build clean display string
     const cleanDisplay = (() => {
       if (priceDisplay) return priceDisplay
       if (!priceNum) return ''

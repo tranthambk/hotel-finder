@@ -46,6 +46,8 @@ function ResultsContent() {
   const [showFavOnly, setShowFavOnly] = useState(false)
   const [favIds, setFavIds] = useState<Set<string>>(new Set())
   const [loadingMessage, setLoadingMessage] = useState('')
+  const [pendingSites, setPendingSites] = useState(0)
+  const [runLinks, setRunLinks] = useState<{ site: string; url: string }[]>([])
   const { t } = useApp()
 
   const refreshFavs = useCallback(() => {
@@ -56,6 +58,10 @@ function ResultsContent() {
     if (!params.destination) return
     setLoading(true)
     setError(null)
+    setHotels([])
+    setSources([])
+    setRunLinks([])
+    setPendingSites(sites.length)
 
     const messages = [
       t('load.1'), t('load.2'), t('load.3'), t('load.4'),
@@ -78,16 +84,56 @@ function ResultsContent() {
         const text = await res.text()
         throw new Error(`Server lỗi ${res.status}: ${text.slice(0, 200)}`)
       }
-      const data = await res.json()
-      if (data.error) throw new Error(data.error)
-      setHotels(data.hotels || [])
-      setSources(data.sources || [])
+
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const chunk = JSON.parse(line)
+            if (chunk.type === 'site_result') {
+              setHotels((prev) => {
+                const merged = [...prev, ...(chunk.hotels || [])]
+                if (params.priorities.includes('price')) {
+                  merged.sort((a, b) => (a.price?.amount ?? Infinity) - (b.price?.amount ?? Infinity))
+                } else if (params.priorities.includes('rating')) {
+                  merged.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
+                }
+                return merged
+              })
+              setSources((prev) => [...prev, chunk.site])
+              if (chunk.runUrl) {
+                setRunLinks((prev) => [...prev, { site: chunk.site, url: chunk.runUrl }])
+              }
+              setPendingSites((prev) => Math.max(0, prev - 1))
+              setLoading(false)
+            } else if (chunk.type === 'site_error') {
+              setPendingSites((prev) => Math.max(0, prev - 1))
+            } else if (chunk.type === 'done') {
+              setPendingSites(0)
+              setLoading(false)
+            }
+          } catch {
+            // skip malformed line
+          }
+        }
+      }
       setFavIds(new Set(getFavorites().map((h) => h.id)))
     } catch (err) {
       setError(String(err))
     } finally {
       clearInterval(interval)
       setLoading(false)
+      setPendingSites(0)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.destination, params.checkIn, params.checkOut])
@@ -147,15 +193,36 @@ function ResultsContent() {
           </div>
         </div>
 
-        {/* Sources */}
-        {sources.length > 0 && (
+        {/* Sources + run links */}
+        {(sources.length > 0 || pendingSites > 0) && (
           <div className="flex flex-wrap items-center gap-2 mb-6">
             <span className="text-gray-500 text-sm">{t('res.sources')}</span>
-            {sources.map((s) => (
-              <span key={s} className="px-3 py-1 bg-white/10 text-gray-300 rounded-full text-xs font-medium">
-                {s}
+            {sources.map((s) => {
+              const run = runLinks.find((r) => r.site === s)
+              return run ? (
+                <a
+                  key={s}
+                  href={run.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 px-3 py-1 bg-white/10 hover:bg-white/20 text-gray-300 rounded-full text-xs font-medium transition"
+                  title="Xem agent Tinyfish đang chạy"
+                >
+                  {s}
+                  <span className="text-amber-400">↗</span>
+                </a>
+              ) : (
+                <span key={s} className="px-3 py-1 bg-white/10 text-gray-300 rounded-full text-xs font-medium">
+                  {s}
+                </span>
+              )
+            })}
+            {pendingSites > 0 && (
+              <span className="flex items-center gap-1.5 px-3 py-1 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-full text-xs font-medium">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                {pendingSites} trang đang tìm…
               </span>
-            ))}
+            )}
           </div>
         )}
 
