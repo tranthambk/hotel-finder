@@ -146,10 +146,10 @@ function ResultsContent() {
       const reader = res.body!.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-      // Accumulate for cache write at end
       let allHotels: Hotel[] = []
       let allSources: string[] = []
       let allRunLinks: { site: string; url: string }[] = []
+      const siteErrors: string[] = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -177,6 +177,7 @@ function ResultsContent() {
               setPendingSites((prev) => Math.max(0, prev - 1))
               setLoading(false)
             } else if (chunk.type === 'site_error') {
+              siteErrors.push(`${chunk.site}: ${chunk.error}`)
               setPendingSites((prev) => Math.max(0, prev - 1))
             } else if (chunk.type === 'done') {
               setPendingSites(0)
@@ -188,8 +189,15 @@ function ResultsContent() {
         }
       }
 
-      // Save to cache
-      writeCache(getCacheKey(params, sites), { hotels: allHotels, sources: allSources, runLinks: allRunLinks })
+      // If all sites failed and no results, surface the errors
+      if (allHotels.length === 0 && siteErrors.length > 0) {
+        throw new Error(siteErrors.join('\n'))
+      }
+
+      // Save to cache only if we got results
+      if (allHotels.length > 0) {
+        writeCache(getCacheKey(params, sites), { hotels: allHotels, sources: allSources, runLinks: allRunLinks })
+      }
       setFavIds(new Set(getFavorites().map((h) => h.id)))
     } catch (err) {
       setError(String(err))
